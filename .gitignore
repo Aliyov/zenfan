@@ -1,0 +1,21 @@
+# whitelist: only publish the app, driver, Windows port and docs
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/install.sh
+!/fan.sh
+!/app/
+!/driver/
+!/windows/
+!/docs/
+# build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+modules.order
+Module.symvers
+.module-common.o

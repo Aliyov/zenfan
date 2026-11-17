@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Zenfan
+GenericName=Fan Control
+Comment=Switch the CPU fan between full speed and automatic
+Exec=/usr/local/bin/zenfan-gui
+Icon=org.zenfan.Zenfan
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=fan;cooling;temperature;
+StartupNotify=true

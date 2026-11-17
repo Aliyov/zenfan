@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Zenfan - fan control for ASUS Zenbook UX535QE.
+- Full-speed switches for the CPU and GPU fan (off = automatic).
+- Auto-boost: both fans full speed when the CPU reaches X °C, back to
+  automatic below Y °C (runs as the zenfan-boostd service, also when this
+  window is closed)."""
+import glob
+import os
+import sys
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+HELPER = "/usr/local/libexec/zenfan-helper"
+GPU_PROC = "/proc/zenbook_gpufan"
+BOOST_CONF = "/etc/zenfan/boost.conf"
+BOOST_STATE = "/run/zenfan/boost"
+BOOST_TEXT = {"boosting": "Boosting now (full speed)", "waiting": "Watching temperature",
+              "off": "Off"}
+
+
+def hwmon(name):
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            with open(os.path.join(d, "name")) as f:
+                if f.read().strip() == name:
+                    return d
+        except OSError:
+            pass
+    return None
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def boost_conf():
+    conf = {"enabled": 0, "on": 80, "off": 65}
+    for line in (read(BOOST_CONF) or "").splitlines():
+        k, _, v = line.partition("=")
+        if k in conf and v.strip().isdigit():
+            conf[k] = int(v)
+    return conf
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Zenfan")
+        self.set_default_size(420, 0)
+        self.asus = hwmon("asus")
+        self.cpu = hwmon("k10temp")
+        self.busy = False
+        self.pending = 0
+
+        self.toasts = Adw.ToastOverlay()
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        tv.set_content(self.toasts)
+        self.set_content(tv)
+        page = Adw.PreferencesPage()
+        self.toasts.set_child(page)
+
+        # --- status ---
+        info = Adw.PreferencesGroup(title="Status")
+        self.rows = {}
+        for key, title in (("cpu_fan", "CPU fan"), ("gpu_fan", "GPU fan"),
+                           ("cpu_temp", "CPU temperature"), ("boost", "Auto-boost")):
+            row = Adw.ActionRow(title=title)
+            lbl = Gtk.Label(label="…", css_classes=["dim-label", "numeric"])
+            row.add_suffix(lbl)
+            info.add(row)
+            self.rows[key] = lbl
+        page.add(info)
+
+        # --- full speed ---
+        ctl = Adw.PreferencesGroup(title="Full speed",
+                                   description="On = full speed, Off = automatic")
+        self.switches = {}
+        for key, title in (("cpu", "CPU fan full speed"), ("gpu", "GPU fan full speed")):
+            sw = Adw.SwitchRow(title=title)
+            sw.connect("notify::active", self.on_toggle, key)
+            ctl.add(sw)
+            self.switches[key] = sw
+        page.add(ctl)
+
+        # --- auto-boost ---
+        conf = boost_conf()
+        bg = Adw.PreferencesGroup(
+            title="Auto-boost",
+            description="Both fans go to full speed when the CPU gets hot, and back "
+                        "to automatic when it cools down. Keeps working when this "
+                        "window is closed and after a reboot.")
+        sw = Adw.SwitchRow(title="Use auto-boost")
+        sw.connect("notify::active", self.on_boost_toggle)
+        bg.add(sw)
+        self.switches["boost"] = sw
+        self.on_spin = Adw.SpinRow.new_with_range(41, 100, 1)
+        self.on_spin.set_title("Full speed when CPU reaches")
+        self.on_spin.set_subtitle("°C")
+        self.on_spin.set_value(conf["on"])
+        self.off_spin = Adw.SpinRow.new_with_range(40, 99, 1)
+        self.off_spin.set_title("Back to automatic below")
+        self.off_spin.set_subtitle("°C")
+        self.off_spin.set_value(conf["off"])
+        for s in (self.on_spin, self.off_spin):
+            s.connect("notify::value", self.on_spin_changed)
+            bg.add(s)
+        page.add(bg)
+
+        if not self.asus:
+            self.switches["cpu"].set_sensitive(False)
+            self.toast("ASUS fan device not found")
+        if not os.path.exists(GPU_PROC):
+            self.switches["gpu"].set_sensitive(False)
+            self.switches["gpu"].set_subtitle("zenbook_gpufan driver not loaded")
+        self.refresh()
+        GLib.timeout_add_seconds(2, self.refresh)
+
+    # ---------- helpers ----------
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
+
+    def state(self, key):
+        if key == "cpu":
+            return bool(self.asus) and read(f"{self.asus}/pwm1_enable") == "0"
+        if key == "gpu":
+            return read(GPU_PROC) == "1"
+        return bool(boost_conf()["enabled"])
+
+    def refresh(self):
+        if self.asus:
+            self.rows["cpu_fan"].set_label(f"{read(self.asus + '/fan1_input') or '?'} RPM")
+            self.rows["gpu_fan"].set_label(f"{read(self.asus + '/fan2_input') or '?'} RPM")
+        if not self.busy:
+            for key in self.switches:
+                self.set_switch(key, self.state(key))
+        t = read(f"{self.cpu}/temp1_input") if self.cpu else None
+        self.rows["cpu_temp"].set_label(f"{int(t) / 1000:.0f} °C" if t else "?")
+        st = read(BOOST_STATE)
+        self.rows["boost"].set_label(BOOST_TEXT.get(st, "Service not running"))
+        return True
+
+    def set_switch(self, key, state):
+        """Update a switch without triggering its handler."""
+        sw = self.switches[key]
+        if sw.get_active() != state:
+            self.busy = True
+            sw.set_active(state)
+            self.busy = False
+
+    def run_helper(self, key, args, ok_msg):
+        self.busy = True
+        self.switches[key].set_sensitive(False)
+        try:
+            proc = Gio.Subprocess.new(["pkexec", HELPER, *args],
+                                      Gio.SubprocessFlags.STDERR_SILENCE)
+            proc.wait_check_async(None, self.on_done, (key, ok_msg))
+        except GLib.Error as e:
+            self.on_fail(key, e.message)
+
+    def on_done(self, proc, result, data):
+        key, ok_msg = data
+        try:
+            proc.wait_check_finish(result)
+            self.busy = False
+            self.switches[key].set_sensitive(True)
+            self.toast(ok_msg)
+        except GLib.Error:
+            self.on_fail(key, "Could not change fan setting")
+
+    def on_fail(self, key, msg):
+        self.busy = False
+        self.switches[key].set_sensitive(True)
+        self.set_switch(key, self.state(key))
+        self.toast(msg)
+
+    def temps(self):
+        return int(self.on_spin.get_value()), int(self.off_spin.get_value())
+
+    def send_boost(self):
+        on, off = self.temps()
+        if off >= on:
+            self.toast("'Back to automatic' must be lower than 'Full speed'")
+            self.set_switch("boost", self.state("boost"))
+            return
+        self.run_helper("boost", ["boost", "on", str(on), str(off)],
+                        f"Auto-boost: full at {on} °C, automatic below {off} °C")
+
+    # ---------- handlers ----------
+    def on_toggle(self, row, _pspec, key):
+        if self.busy:
+            return
+        want = row.get_active()
+        self.run_helper(key, [key, "on" if want else "off"],
+                        f"{key.upper()} fan: {'FULL SPEED' if want else 'AUTO'}")
+
+    def on_boost_toggle(self, row, _pspec):
+        if self.busy:
+            return
+        if row.get_active():
+            self.send_boost()
+        else:
+            self.run_helper("boost", ["boost", "off"], "Auto-boost off")
+
+    def on_spin_changed(self, *_):
+        # wait until the user stops clicking, then save (only if boost is on)
+        if self.pending:
+            GLib.source_remove(self.pending)
+        self.pending = GLib.timeout_add(1000, self.spin_settled)
+
+    def spin_settled(self):
+        self.pending = 0
+        if self.switches["boost"].get_active() and not self.busy:
+            self.send_boost()
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="org.zenfan.Zenfan")
+
+    def do_activate(self):
+        (self.props.active_window or Window(self)).present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

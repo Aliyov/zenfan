@@ -1,0 +1,45 @@
+#!/bin/bash
+# Root helper for Zenfan. Called by the GUI via pkexec. Accepts only:
+#   zenfan-helper cpu|gpu|all on|off      on = full speed, off = automatic
+#   zenfan-helper boost off               disable auto-boost
+#   zenfan-helper boost on <ON> <OFF>     auto-boost: full at ON °C, auto at OFF °C
+set -eu
+usage() { echo "usage: zenfan-helper cpu|gpu|all on|off | boost off | boost on ON OFF" >&2; exit 2; }
+CONF=/etc/zenfan/boost.conf
+FAN_CPU() {
+    for d in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$d/name")" = "asus" ] && { echo "$1" > "$d/pwm1_enable"; return 0; }
+    done
+    echo "asus fan device not found" >&2; return 1
+}
+FAN_GPU() {
+    [ -w /proc/zenbook_gpufan ] || { echo "zenbook_gpufan driver not loaded" >&2; return 1; }
+    echo "$1" > /proc/zenbook_gpufan
+}
+conf_get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -1; }
+
+if [ "${1:-}" = boost ]; then
+    mkdir -p /etc/zenfan
+    case "${2:-}" in
+        off) ON=$(conf_get on); OFF=$(conf_get off)
+             printf 'enabled=0\non=%s\noff=%s\n' "${ON:-80}" "${OFF:-65}" > "$CONF" ;;
+        on)  ON=${3:-}; OFF=${4:-}
+             [[ "$ON" =~ ^[0-9]{2,3}$ && "$OFF" =~ ^[0-9]{2,3}$ ]] || usage
+             (( OFF >= 40 && OFF < ON && ON <= 100 )) || { echo "need 40 <= OFF < ON <= 100" >&2; exit 2; }
+             printf 'enabled=1\non=%s\noff=%s\n' "$ON" "$OFF" > "$CONF" ;;
+        *)   usage ;;
+    esac
+    exit 0
+fi
+
+case "${2:-}" in
+    on)  CPU=0 GPU=1 ;;
+    off) CPU=2 GPU=0 ;;
+    *)   usage ;;
+esac
+case "${1:-}" in
+    cpu) FAN_CPU $CPU ;;
+    gpu) FAN_GPU $GPU ;;
+    all) FAN_CPU $CPU; FAN_GPU $GPU ;;
+    *)   usage ;;
+esac

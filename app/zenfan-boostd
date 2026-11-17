@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""zenfan-boostd - auto-boost service for ASUS Zenbook UX535QE.
+
+When the CPU reaches ON °C, both fans go to full speed. When it cools to
+OFF °C, the fans this service boosted go back to automatic. Fans that the
+user switched on by hand are never touched.
+
+Config (re-read every cycle):  /etc/zenfan/boost.conf
+    enabled=1
+    on=80
+    off=65
+State for the GUI:             /run/zenfan/boost   ("off" | "waiting" | "boosting")
+"""
+import glob
+import os
+import signal
+import sys
+import time
+
+CONF = "/etc/zenfan/boost.conf"
+STATE = "/run/zenfan/boost"
+GPU = "/proc/zenbook_gpufan"
+INTERVAL = 2
+
+
+def hwmon(name):
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            with open(os.path.join(d, "name")) as f:
+                if f.read().strip() == name:
+                    return d
+        except OSError:
+            pass
+    return None
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def write(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+        return True
+    except OSError as e:
+        print(f"write {path}: {e}", file=sys.stderr, flush=True)
+        return False
+
+
+def load_conf():
+    conf = {"enabled": 0, "on": 80, "off": 65}
+    for line in (read(CONF) or "").splitlines():
+        k, _, v = line.partition("=")
+        if k.strip() in conf:
+            try:
+                conf[k.strip()] = int(v)
+            except ValueError:
+                pass
+    if not (40 <= conf["off"] < conf["on"] <= 100):
+        conf["enabled"] = 0
+    return conf
+
+
+ASUS = hwmon("asus")
+CPUT = hwmon("k10temp")
+if not ASUS or not CPUT:
+    sys.exit("asus or k10temp hwmon not found")
+PWM = f"{ASUS}/pwm1_enable"
+
+boosted = {"cpu": False, "gpu": False}   # fans THIS service switched on
+
+
+def full(fan):
+    if fan == "cpu":
+        return read(PWM) == "0"
+    return read(GPU) == "1"
+
+
+def set_fan(fan, on):
+    if fan == "cpu":
+        return write(PWM, 0 if on else 2)
+    return os.path.exists(GPU) and write(GPU, 1 if on else 0)
+
+
+def release():
+    for fan, mine in boosted.items():
+        if mine:
+            set_fan(fan, False)
+            boosted[fan] = False
+
+
+def stop(*_):
+    release()
+    write(STATE, "off")
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+os.makedirs(os.path.dirname(STATE), exist_ok=True)
+
+while True:
+    c = load_conf()
+    temp = int(read(f"{CPUT}/temp1_input") or 0) / 1000
+    if not c["enabled"]:
+        release()
+        state = "off"
+    elif temp >= c["on"] and not any(boosted.values()):
+        for fan in boosted:
+            if not full(fan) and set_fan(fan, True):   # leave manual ones alone
+                boosted[fan] = True
+        if any(boosted.values()):
+            print(f"{temp:.0f} °C >= {c['on']} -> full speed {boosted}", flush=True)
+        state = "boosting"
+    elif temp <= c["off"] and any(boosted.values()):
+        release()
+        print(f"{temp:.0f} °C <= {c['off']} -> automatic", flush=True)
+        state = "waiting"
+    else:
+        state = "boosting" if any(boosted.values()) else "waiting"
+    write(STATE, state)
+    time.sleep(INTERVAL)
